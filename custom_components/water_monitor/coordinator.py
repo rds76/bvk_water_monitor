@@ -13,6 +13,7 @@ import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .auth_guard import LoginGuard
@@ -22,9 +23,11 @@ from .const import (
     CONF_PASSWORD,
     CONF_USERNAME,
     DEFAULT_UPDATE_INTERVAL,
+    DOMAIN,
     SUEZ_BASE_URL,
     SUEZ_DAILY_URL,
     SUEZ_HOME_URL,
+    SUEZ_TOKEN_STORE_KEY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,6 +47,10 @@ _HEADERS = {
 }
 
 
+class _SuezTokenExpired(Exception):
+    """The cached SUEZ token URL was rejected by the portal."""
+
+
 class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator that fetches water consumption data from BVK / SUEZ portals."""
 
@@ -57,6 +64,12 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._username: str = entry.data[CONF_USERNAME]
         self._password: str = entry.data[CONF_PASSWORD]
         self._login_guard = LoginGuard(hass, entry.entry_id)
+        self._token_store: Store[dict[str, dict[str, str]]] = Store(
+            hass,
+            1,
+            f"{DOMAIN}.{SUEZ_TOKEN_STORE_KEY}.{entry.entry_id}",
+            atomic_writes=True,
+        )
         self._session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------
@@ -242,14 +255,15 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     current_url = urllib.parse.urljoin(current_url, location)
                 continue
 
+            if status in (401, 403):
+                raise _SuezTokenExpired(f"SUEZ rejected token (HTTP {status})")
+
             if status == 200:
                 if "Login.aspx" not in current_url:
                     _LOGGER.debug("SUEZ auth complete")
                     return current_url
                 # Landed on Login page — token is invalid or expired
-                raise ConfigEntryAuthFailed(
-                    "SUEZ token URL is invalid or has expired — please reconfigure"
-                )
+                raise _SuezTokenExpired("SUEZ token URL is invalid or has expired")
 
             raise UpdateFailed(f"SUEZ auth: unexpected HTTP {status}")
 
@@ -346,9 +360,46 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Main update
     # ------------------------------------------------------------------
 
-    async def _async_update_data(self) -> dict[str, Any]:
-        """Log into BVK, get fresh SUEZ tokens per place, fetch consumption data."""
+    async def _async_load_cached_places(self) -> list[dict[str, str]]:
+        """Load the persisted SUEZ token URLs and place labels."""
+        cached = await self._token_store.async_load()
+        if not cached:
+            return []
 
+        places: list[dict[str, str]] = []
+        for cp_id, details in cached.items():
+            if (
+                not isinstance(cp_id, str)
+                or not isinstance(details, dict)
+                or not isinstance(details.get("cp_num"), str)
+                or not isinstance(details.get("token_url"), str)
+            ):
+                _LOGGER.warning("Stored SUEZ token cache is invalid; refreshing it from BVK")
+                return []
+            places.append(
+                {
+                    "cp_id": cp_id,
+                    "cp_num": details["cp_num"],
+                    "token_url": details["token_url"],
+                }
+            )
+        return places
+
+    async def _async_store_places(self, places: list[dict[str, str]]) -> None:
+        """Persist the current place labels and SUEZ token URLs."""
+        cached = {
+            place["cp_id"]: {
+                "cp_num": place["cp_num"],
+                "token_url": place["token_url"],
+            }
+            for place in places
+        }
+        await self._token_store.async_save(cached)
+        if await self._token_store.async_load() != cached:
+            raise UpdateFailed("Could not persist the SUEZ token URLs")
+
+    async def _async_refresh_places_from_bvk(self) -> list[dict[str, str]]:
+        """Log into BVK, rediscover places and refresh their SUEZ token URLs."""
         # Fresh session for the BVK login + place discovery phase
         if self._session and not self._session.closed:
             await self._session.close()
@@ -369,7 +420,13 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Please verify your account has registered meters."
             )
 
-        # Step 2: For each place, authenticate to SUEZ and fetch data
+        await self._async_store_places(places)
+        return places
+
+    async def _async_fetch_data_for_places(
+        self, places: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        """Authenticate to SUEZ with cached URLs and fetch consumption data."""
         result: dict[str, Any] = {}
         for place in places:
             place_session = self._new_session()
@@ -409,6 +466,24 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed("Failed to fetch data from any consumption place")
 
         return result
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Reuse cached SUEZ URLs; refresh them from BVK only when rejected."""
+        places = await self._async_load_cached_places()
+        if not places:
+            places = await self._async_refresh_places_from_bvk()
+
+        try:
+            return await self._async_fetch_data_for_places(places)
+        except _SuezTokenExpired:
+            _LOGGER.info("Cached SUEZ token expired; refreshing token URLs from BVK")
+            places = await self._async_refresh_places_from_bvk()
+            try:
+                return await self._async_fetch_data_for_places(places)
+            except _SuezTokenExpired as exc:
+                raise UpdateFailed(
+                    "SUEZ rejected refreshed token URLs"
+                ) from exc
 
 
 # ------------------------------------------------------------------

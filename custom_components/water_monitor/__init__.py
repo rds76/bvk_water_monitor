@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 
 from .auth_guard import LoginGuard
-from .const import DOMAIN
+from .const import DOMAIN, SUEZ_TOKEN_STORE_KEY
 from .coordinator import BVKWaterCoordinator
 
 PLATFORMS = ["sensor"]
@@ -33,5 +34,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Remove the persistent login guard when the integration is removed."""
+    """Remove persistent login state when the integration is removed."""
     await LoginGuard(hass, entry.entry_id).async_remove()
+    await Store(
+        hass,
+        1,
+        f"{DOMAIN}.{SUEZ_TOKEN_STORE_KEY}.{entry.entry_id}",
+        atomic_writes=True,
+    ).async_remove()

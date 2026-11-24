@@ -18,14 +18,17 @@ The daily sensor also exposes a `last_7_days` attribute with a date → litres h
 
 ## How it works
 
-1. Authenticates with the [BVK customer portal](https://zis.bvk.cz) using your email and password.
-2. Uses a SUEZ Smart Solutions token URL to authenticate with the smart-meter data portal at `cz-sitr.suezsmartsolutions.com`.
+1. Authenticates with the [BVK customer portal](https://zis.bvk.cz) using your email and password when setup needs token URLs.
+2. Caches SUEZ Smart Solutions token URLs locally and reuses them to access `cz-sitr.suezsmartsolutions.com`.
 3. Scrapes the portal for meter index, daily and monthly consumption every **2 hours**.
 
-Every update starts a new BVK login. If a login fails or cannot be confirmed,
+On setup or if the local token cache is missing, the integration logs into BVK
+and stores the SUEZ token URLs locally. Later updates reuse those URLs; a BVK
+login is repeated only when SUEZ rejects a cached URL. A network failure alone
+does not trigger a BVK login. Newly added consumption places are discovered
+when token URLs are refreshed. If a BVK login fails or cannot be confirmed,
 automatic login is paused, including after a Home Assistant restart. Re-enter
 your credentials when Home Assistant requests re-authentication to resume.
-A network failure during login also pauses attempts to avoid repeated submissions.
 
 ---
 
