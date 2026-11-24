@@ -519,6 +519,17 @@ def _extract_input(html: str, field_suffix: str) -> str | None:
 
 
 def _extract_suez_token_url(html: str) -> str | None:
-    """Extract the first SUEZ token URL from a BVK consumption-place page."""
-    m = re.search(r'href="(https://cz-sitr[^"]+)"', html)
-    return _html.unescape(m.group(1)) if m else None
+    """Extract the SUEZ token URL from BVK's eMIS portal link."""
+    anchor = re.search(
+        r'<a\b(?=[^>]*\bid=["\'][^"\']*btnPortalEmis["\'])[^>]*>',
+        html,
+        re.IGNORECASE,
+    )
+    if anchor:
+        href = re.search(r'\bhref=["\']([^"\']+)["\']', anchor.group(0), re.IGNORECASE)
+        if href and href.group(1).startswith("https://cz-sitr"):
+            return _html.unescape(href.group(1))
+
+    # Keep compatibility with portal variants that omit the eMIS link ID.
+    fallback = re.search(r'href=["\'](https://cz-sitr[^"\']+)["\']', html, re.IGNORECASE)
+    return _html.unescape(fallback.group(1)) if fallback else None
