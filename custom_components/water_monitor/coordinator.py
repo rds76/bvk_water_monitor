@@ -110,8 +110,22 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ) as resp:
                 resp.raise_for_status()
                 html = await resp.text()
+                final_path = resp.url.path.lower()
         except aiohttp.ClientError as exc:
             raise UpdateFailed(f"BVK ConsumptionPlaceList fetch failed: {exc}") from exc
+
+        if final_path.endswith("/userdata/maininfo.aspx"):
+            cp_id = _extract_input(html, "edCpId")
+            cp_num = (_extract_input(html, "edCpEvNum") or cp_id or "").strip()
+            token_url = _extract_suez_token_url(html)
+            if not cp_id or not token_url:
+                _LOGGER.warning(
+                    "BVK MainInfo redirect did not contain a consumption place ID "
+                    "and SUEZ token URL"
+                )
+                return []
+            _LOGGER.debug("BVK place %s (OM %s): token URL found", cp_id, cp_num)
+            return [{"cp_id": cp_id, "cp_num": cp_num, "token_url": token_url}]
 
         # Find Show$N postback targets from HTML-encoded onclick attributes.
         # The page renders onclick as: onclick="javascript:__doPostBack(&#39;target&#39;,&#39;Show$0&#39;)"
@@ -158,12 +172,11 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             cp_num = (_extract_input(detail_html, "edCpEvNum") or cp_id).strip()
 
             # Extract fresh SUEZ token URL — the first href pointing to cz-sitr
-            m = re.search(r'href="(https://cz-sitr[^"]+)"', detail_html)
-            if not m:
+            token_url = _extract_suez_token_url(detail_html)
+            if not token_url:
                 _LOGGER.warning("BVK %s: no SUEZ token URL found in MainInfo page", event_arg)
                 continue
 
-            token_url = _html.unescape(m.group(1))
             places.append({"cp_id": cp_id, "cp_num": cp_num, "token_url": token_url})
             _LOGGER.debug("BVK place %s (OM %s): token URL found", cp_id, cp_num)
 
@@ -503,3 +516,9 @@ def _extract_input(html: str, field_suffix: str) -> str | None:
             html,
         )
     return m.group(1) if m else None
+
+
+def _extract_suez_token_url(html: str) -> str | None:
+    """Extract the first SUEZ token URL from a BVK consumption-place page."""
+    m = re.search(r'href="(https://cz-sitr[^"]+)"', html)
+    return _html.unescape(m.group(1)) if m else None
