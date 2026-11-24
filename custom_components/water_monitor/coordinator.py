@@ -6,6 +6,7 @@ import html as _html
 import logging
 import re
 import urllib.parse
+from html.parser import HTMLParser
 from typing import Any
 
 import aiohttp
@@ -519,17 +520,40 @@ def _extract_input(html: str, field_suffix: str) -> str | None:
 
 
 def _extract_suez_token_url(html: str) -> str | None:
-    """Extract the SUEZ token URL from BVK's eMIS portal link."""
-    anchor = re.search(
-        r'<a\b(?=[^>]*\bid=["\'][^"\']*btnPortalEmis["\'])[^>]*>',
-        html,
-        re.IGNORECASE,
-    )
-    if anchor:
-        href = re.search(r'\bhref=["\']([^"\']+)["\']', anchor.group(0), re.IGNORECASE)
-        if href and href.group(1).startswith("https://cz-sitr"):
-            return _html.unescape(href.group(1))
+    """Find one unambiguous BVK SUEZ token URL, independent of link markup."""
+    class HrefParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.hrefs: list[str] = []
 
-    # Keep compatibility with portal variants that omit the eMIS link ID.
-    fallback = re.search(r'href=["\'](https://cz-sitr[^"\']+)["\']', html, re.IGNORECASE)
-    return _html.unescape(fallback.group(1)) if fallback else None
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag.lower() == "a":
+                self.hrefs.extend(
+                    value
+                    for name, value in attrs
+                    if name.lower() == "href" and value is not None
+                )
+
+    parser = HrefParser()
+    parser.feed(html)
+
+    candidates: set[str] = set()
+    for href in parser.hrefs:
+        url = _html.unescape(href).strip()
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            query = urllib.parse.parse_qs(parsed.query)
+        except ValueError:
+            continue
+        if (
+            parsed.scheme.lower() == "https"
+            and parsed.netloc.lower() == "cz-sitr.suezsmartsolutions.com"
+            and parsed.path.lower() == "/emis.se_bvk/login.aspx"
+            and any(value for value in query.get("token", []))
+        ):
+            candidates.add(url)
+
+    if len(candidates) > 1:
+        _LOGGER.warning("BVK page contains multiple distinct SUEZ token URLs")
+        return None
+    return next(iter(candidates), None)
