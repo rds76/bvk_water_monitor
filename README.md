@@ -2,6 +2,8 @@
 
 A [HACS](https://hacs.xyz/)-compatible Home Assistant integration that pulls water consumption data from the **BVK (Brněnské vodárny a kanalizace)** customer portal and exposes it as sensors in Home Assistant.
 
+This repository is a modified fork of [koooop/bvk_water_monitor](https://github.com/koooop/bvk_water_monitor).
+
 ---
 
 ## Sensors
@@ -18,9 +20,17 @@ The daily sensor also exposes a `last_7_days` attribute with a date → litres h
 
 ## How it works
 
-1. Authenticates with the [BVK customer portal](https://zis.bvk.cz) using your email and password.
-2. Uses a SUEZ Smart Solutions token URL to authenticate with the smart-meter data portal at `cz-sitr.suezsmartsolutions.com`.
+1. Authenticates with the [BVK customer portal](https://zis.bvk.cz) using your email and password when setup needs token URLs.
+2. Caches SUEZ Smart Solutions token URLs locally and reuses them to access `cz-sitr.suezsmartsolutions.com`.
 3. Scrapes the portal for meter index, daily and monthly consumption every **2 hours**.
+
+On setup or if the local token cache is missing, the integration logs into BVK
+and stores the SUEZ token URLs locally. Later updates reuse those URLs; a BVK
+login is repeated only when SUEZ rejects a cached URL. A network failure alone
+does not trigger a BVK login. Newly added consumption places are discovered
+when token URLs are refreshed. If a BVK login fails or cannot be confirmed,
+automatic login is paused, including after a Home Assistant restart. Re-enter
+your credentials when Home Assistant requests re-authentication to resume.
 
 ---
 
@@ -29,7 +39,7 @@ The daily sensor also exposes a `last_7_days` attribute with a date → litres h
 ### Via HACS (recommended)
 
 1. In HACS go to **Integrations → ⋮ → Custom repositories**.
-2. Add `https://github.com/koooop/bvk_water_monitor` with category **Integration**.
+2. Add `https://github.com/rds76/bvk_water_monitor` with category **Integration**.
 3. Install **BVK Water Monitor** and restart Home Assistant.
 
 ### Manual
@@ -46,20 +56,9 @@ Go to **Settings → Integrations → Add Integration → BVK Water Monitor**.
 ### Step 1 — BVK credentials
 Enter your **email** and **password** for the BVK customer portal (`https://zis.bvk.cz`).
 
-The integration attempts to auto-detect your SUEZ smart-meter token URL. If your account has smart metering enabled and the token is found automatically, setup completes here.
-
-### Step 2 — SUEZ token URL *(only if auto-detection fails)*
-
-1. Open [https://zis.bvk.cz](https://zis.bvk.cz) in your browser and log in.
-2. Navigate to **Odběrná místa** (Consumption Places).
-3. Click the **smart meter icon** next to your consumption place.
-4. Copy the full URL from the browser address bar — it will look like:
-   ```
-   https://cz-sitr.suezsmartsolutions.com/eMIS.SE_BVK/Login.aspx?token=<long_token>&langue=cs-CZ
-   ```
-5. Paste it into the **SUEZ token URL** field.
-
-> **Note:** The token is long-lived (valid for months). If it ever stops working, repeat the steps above to get a fresh one and update the integration via **Settings → Integrations → BVK Water Monitor → Reconfigure**.
+The integration validates the credentials once for each form submission. If
+validation fails, it remains on the form and does not retry automatically.
+After successful setup, it logs in to discover the smart-meter token URL.
 
 ---
 
@@ -73,9 +72,9 @@ Currently only **BVK Brno (Czech Republic)** is supported. The integration relie
 
 | Symptom | Fix |
 |---|---|
-| `Invalid auth` at setup | Double-check your BVK email and password. |
-| Sensors unavailable after HA restart | The SUEZ session expired. The integration retries automatically using the stored token URL. |
-| Token URL validation fails | Get a fresh token URL by logging into BVK in your browser (see Step 2 above). |
+| Login fails at setup | Check the account and credentials before submitting the form again. |
+| Re-authentication requested | Login failed or could not be confirmed. Check the BVK portal and network, then re-enter your credentials. No automatic login is attempted until then. |
+| Sensors unavailable | Check connectivity and whether the BVK and SUEZ portals are available. |
 | Data is 1–2 days behind | Expected — the smart meter transmits readings with a ~24 h delay. |
 
 ---

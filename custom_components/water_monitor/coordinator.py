@@ -1,27 +1,33 @@
 """DataUpdateCoordinator for BVK Water Monitor."""
 from __future__ import annotations
 
+import asyncio
 import html as _html
 import logging
 import re
 import urllib.parse
+from html.parser import HTMLParser
 from typing import Any
 
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .auth_guard import LoginGuard
 from .const import (
     BVK_LOGIN_URL,
     BVK_PLACE_LIST_URL,
     CONF_PASSWORD,
     CONF_USERNAME,
     DEFAULT_UPDATE_INTERVAL,
+    DOMAIN,
     SUEZ_BASE_URL,
     SUEZ_DAILY_URL,
     SUEZ_HOME_URL,
+    SUEZ_TOKEN_STORE_KEY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,6 +47,10 @@ _HEADERS = {
 }
 
 
+class _SuezTokenExpired(Exception):
+    """The cached SUEZ token URL was rejected by the portal."""
+
+
 class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator that fetches water consumption data from BVK / SUEZ portals."""
 
@@ -53,6 +63,13 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._username: str = entry.data[CONF_USERNAME]
         self._password: str = entry.data[CONF_PASSWORD]
+        self._login_guard = LoginGuard(hass, entry.entry_id)
+        self._token_store: Store[dict[str, dict[str, str]]] = Store(
+            hass,
+            1,
+            f"{DOMAIN}.{SUEZ_TOKEN_STORE_KEY}.{entry.entry_id}",
+            atomic_writes=True,
+        )
         self._session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------
@@ -78,47 +95,21 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
 
     async def _bvk_login(self, session: aiohttp.ClientSession) -> None:
-        """Log in to the BVK portal."""
-        try:
-            async with session.get(
-                BVK_LOGIN_URL, timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-        except aiohttp.ClientError as exc:
-            raise UpdateFailed(f"BVK login page fetch failed: {exc}") from exc
-
-        viewstate = _extract_hidden(html, "__VIEWSTATE")
-        if not viewstate:
-            raise UpdateFailed("Could not parse BVK login page (missing __VIEWSTATE)")
-
-        payload = {
-            "__VIEWSTATE": viewstate,
-            "__VIEWSTATEGENERATOR": _extract_hidden(html, "__VIEWSTATEGENERATOR") or "",
-            "__PREVIOUSPAGE": _extract_hidden(html, "__PREVIOUSPAGE") or "",
-            "__EVENTVALIDATION": _extract_hidden(html, "__EVENTVALIDATION") or "",
-            _BVK_FIELD_EMAIL: self._username,
-            _BVK_FIELD_PASSWORD: self._password,
-            _BVK_FIELD_SUBMIT: "Vstoupit",
-            "ctl00$ctl00$captchaToken": "",
-            "ctl00$ctl00$crs": "",
-        }
-        try:
-            async with session.post(
-                BVK_LOGIN_URL,
-                data=payload,
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-        except aiohttp.ClientError as exc:
-            raise UpdateFailed(f"BVK login POST failed: {exc}") from exc
-
-        if "Odhlášení" not in html and "odhlaseni" not in html.lower():
-            raise ConfigEntryAuthFailed(
-                "BVK login failed — check your email and password"
-            )
+        """Log in once, stopping future attempts if login cannot be confirmed."""
+        async with self._login_guard.lock:
+            if await self._login_guard.async_is_blocked():
+                raise ConfigEntryAuthFailed(
+                    "BVK login is paused; re-enter your credentials to resume."
+                )
+            await self._login_guard.async_set_blocked(True)
+            try:
+                await _async_bvk_login(session, self._username, self._password)
+                await self._login_guard.async_set_blocked(False)
+            except (UpdateFailed, ConfigEntryAuthFailed, asyncio.TimeoutError) as exc:
+                raise ConfigEntryAuthFailed(
+                    "BVK login failed or could not be confirmed; "
+                    "re-enter your credentials to resume."
+                ) from exc
 
     async def _bvk_get_all_places(
         self, session: aiohttp.ClientSession
@@ -133,8 +124,22 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ) as resp:
                 resp.raise_for_status()
                 html = await resp.text()
+                final_path = resp.url.path.lower()
         except aiohttp.ClientError as exc:
             raise UpdateFailed(f"BVK ConsumptionPlaceList fetch failed: {exc}") from exc
+
+        if final_path.endswith("/userdata/maininfo.aspx"):
+            cp_id = _extract_input(html, "edCpId")
+            cp_num = (_extract_input(html, "edCpEvNum") or cp_id or "").strip()
+            token_url = _extract_suez_token_url(html)
+            if not cp_id or not token_url:
+                _LOGGER.warning(
+                    "BVK MainInfo redirect did not contain a consumption place ID "
+                    "and SUEZ token URL"
+                )
+                return []
+            _LOGGER.debug("BVK place %s (OM %s): token URL found", cp_id, cp_num)
+            return [{"cp_id": cp_id, "cp_num": cp_num, "token_url": token_url}]
 
         # Find Show$N postback targets from HTML-encoded onclick attributes.
         # The page renders onclick as: onclick="javascript:__doPostBack(&#39;target&#39;,&#39;Show$0&#39;)"
@@ -181,12 +186,11 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             cp_num = (_extract_input(detail_html, "edCpEvNum") or cp_id).strip()
 
             # Extract fresh SUEZ token URL — the first href pointing to cz-sitr
-            m = re.search(r'href="(https://cz-sitr[^"]+)"', detail_html)
-            if not m:
+            token_url = _extract_suez_token_url(detail_html)
+            if not token_url:
                 _LOGGER.warning("BVK %s: no SUEZ token URL found in MainInfo page", event_arg)
                 continue
 
-            token_url = _html.unescape(m.group(1))
             places.append({"cp_id": cp_id, "cp_num": cp_num, "token_url": token_url})
             _LOGGER.debug("BVK place %s (OM %s): token URL found", cp_id, cp_num)
 
@@ -209,7 +213,7 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         allow_redirects=False and follow redirects manually so each step sees the
         cookies set by the previous response.
         """
-        _LOGGER.debug("SUEZ auth: requesting %s", token_url[:80])
+        _LOGGER.debug("SUEZ authentication started")
         _suez_headers = {
             "Referer": "https://zis.bvk.cz/ConsumptionPlaceList.aspx",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -236,11 +240,10 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     # last non-expired value for each name so it ends up in the jar.
                     _inject_cookies(session, resp)
 
-            except aiohttp.ClientError as exc:
-                raise UpdateFailed(f"SUEZ auth request failed: {exc}") from exc
+            except aiohttp.ClientError:
+                raise UpdateFailed("SUEZ auth request failed") from None
 
-            _LOGGER.debug("SUEZ auth step %d: status=%d url=%s location=%s",
-                          step + 1, status, current_url[:80], location[:80])
+            _LOGGER.debug("SUEZ auth step %d: status=%d", step + 1, status)
 
             if status in (301, 302, 303, 307, 308) and location:
                 # Resolve relative Location header
@@ -252,16 +255,17 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     current_url = urllib.parse.urljoin(current_url, location)
                 continue
 
+            if status in (401, 403):
+                raise _SuezTokenExpired(f"SUEZ rejected token (HTTP {status})")
+
             if status == 200:
                 if "Login.aspx" not in current_url:
-                    _LOGGER.debug("SUEZ auth complete: %s", current_url)
+                    _LOGGER.debug("SUEZ auth complete")
                     return current_url
                 # Landed on Login page — token is invalid or expired
-                raise ConfigEntryAuthFailed(
-                    "SUEZ token URL is invalid or has expired — please reconfigure"
-                )
+                raise _SuezTokenExpired("SUEZ token URL is invalid or has expired")
 
-            raise UpdateFailed(f"SUEZ auth: unexpected HTTP {status} at {current_url}")
+            raise UpdateFailed(f"SUEZ auth: unexpected HTTP {status}")
 
         raise UpdateFailed("SUEZ auth: too many redirects")
 
@@ -356,9 +360,46 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Main update
     # ------------------------------------------------------------------
 
-    async def _async_update_data(self) -> dict[str, Any]:
-        """Log into BVK, get fresh SUEZ tokens per place, fetch consumption data."""
+    async def _async_load_cached_places(self) -> list[dict[str, str]]:
+        """Load the persisted SUEZ token URLs and place labels."""
+        cached = await self._token_store.async_load()
+        if not cached:
+            return []
 
+        places: list[dict[str, str]] = []
+        for cp_id, details in cached.items():
+            if (
+                not isinstance(cp_id, str)
+                or not isinstance(details, dict)
+                or not isinstance(details.get("cp_num"), str)
+                or not isinstance(details.get("token_url"), str)
+            ):
+                _LOGGER.warning("Stored SUEZ token cache is invalid; refreshing it from BVK")
+                return []
+            places.append(
+                {
+                    "cp_id": cp_id,
+                    "cp_num": details["cp_num"],
+                    "token_url": details["token_url"],
+                }
+            )
+        return places
+
+    async def _async_store_places(self, places: list[dict[str, str]]) -> None:
+        """Persist the current place labels and SUEZ token URLs."""
+        cached = {
+            place["cp_id"]: {
+                "cp_num": place["cp_num"],
+                "token_url": place["token_url"],
+            }
+            for place in places
+        }
+        await self._token_store.async_save(cached)
+        if await self._token_store.async_load() != cached:
+            raise UpdateFailed("Could not persist the SUEZ token URLs")
+
+    async def _async_refresh_places_from_bvk(self) -> list[dict[str, str]]:
+        """Log into BVK, rediscover places and refresh their SUEZ token URLs."""
         # Fresh session for the BVK login + place discovery phase
         if self._session and not self._session.closed:
             await self._session.close()
@@ -366,8 +407,12 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         session = self._session
 
         # Step 1: BVK login → enumerate all consumption places
-        await self._bvk_login(session)
-        places = await self._bvk_get_all_places(session)
+        try:
+            await self._bvk_login(session)
+            places = await self._bvk_get_all_places(session)
+        finally:
+            await session.close()
+            self._session = None
 
         if not places:
             raise UpdateFailed(
@@ -375,7 +420,13 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Please verify your account has registered meters."
             )
 
-        # Step 2: For each place, authenticate to SUEZ and fetch data
+        await self._async_store_places(places)
+        return places
+
+    async def _async_fetch_data_for_places(
+        self, places: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        """Authenticate to SUEZ with cached URLs and fetch consumption data."""
         result: dict[str, Any] = {}
         for place in places:
             place_session = self._new_session()
@@ -416,10 +467,72 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return result
 
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Reuse cached SUEZ URLs; refresh them from BVK only when rejected."""
+        places = await self._async_load_cached_places()
+        if not places:
+            places = await self._async_refresh_places_from_bvk()
+
+        try:
+            return await self._async_fetch_data_for_places(places)
+        except _SuezTokenExpired:
+            _LOGGER.info("Cached SUEZ token expired; refreshing token URLs from BVK")
+            places = await self._async_refresh_places_from_bvk()
+            try:
+                return await self._async_fetch_data_for_places(places)
+            except _SuezTokenExpired as exc:
+                raise UpdateFailed(
+                    "SUEZ rejected refreshed token URLs"
+                ) from exc
+
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+async def _async_bvk_login(
+    session: aiohttp.ClientSession, username: str, password: str
+) -> None:
+    """Submit one BVK login and verify the resulting page."""
+    try:
+        async with session.get(
+            BVK_LOGIN_URL, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise UpdateFailed("Could not load the BVK login page") from None
+
+    viewstate = _extract_hidden(html, "__VIEWSTATE")
+    if not viewstate:
+        raise UpdateFailed("Could not parse the BVK login page (missing __VIEWSTATE)")
+
+    payload = {
+        "__VIEWSTATE": viewstate,
+        "__VIEWSTATEGENERATOR": _extract_hidden(html, "__VIEWSTATEGENERATOR") or "",
+        "__PREVIOUSPAGE": _extract_hidden(html, "__PREVIOUSPAGE") or "",
+        "__EVENTVALIDATION": _extract_hidden(html, "__EVENTVALIDATION") or "",
+        _BVK_FIELD_EMAIL: username,
+        _BVK_FIELD_PASSWORD: password,
+        _BVK_FIELD_SUBMIT: "Vstoupit",
+        "ctl00$ctl00$captchaToken": "",
+        "ctl00$ctl00$crs": "",
+    }
+    try:
+        async with session.post(
+            BVK_LOGIN_URL,
+            data=payload,
+            allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise UpdateFailed("BVK login could not be confirmed") from None
+
+    if "Odhlášení" not in html and "odhlaseni" not in html.lower():
+        raise ConfigEntryAuthFailed("BVK login was not confirmed")
+
 
 def _extract_hidden(html: str, field_id: str) -> str | None:
     """Extract value of an ASP.NET hidden field by name or id."""
@@ -479,3 +592,43 @@ def _extract_input(html: str, field_suffix: str) -> str | None:
             html,
         )
     return m.group(1) if m else None
+
+
+def _extract_suez_token_url(html: str) -> str | None:
+    """Find one unambiguous BVK SUEZ token URL, independent of link markup."""
+    class HrefParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.hrefs: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag.lower() == "a":
+                self.hrefs.extend(
+                    value
+                    for name, value in attrs
+                    if name.lower() == "href" and value is not None
+                )
+
+    parser = HrefParser()
+    parser.feed(html)
+
+    candidates: set[str] = set()
+    for href in parser.hrefs:
+        url = _html.unescape(href).strip()
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            query = urllib.parse.parse_qs(parsed.query)
+        except ValueError:
+            continue
+        if (
+            parsed.scheme.lower() == "https"
+            and parsed.netloc.lower() == "cz-sitr.suezsmartsolutions.com"
+            and parsed.path.lower() == "/emis.se_bvk/login.aspx"
+            and any(value for value in query.get("token", []))
+        ):
+            candidates.add(url)
+
+    if len(candidates) > 1:
+        _LOGGER.warning("BVK page contains multiple distinct SUEZ token URLs")
+        return None
+    return next(iter(candidates), None)

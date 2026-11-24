@@ -19,6 +19,7 @@ CONF_PASSWORD = "password"
 
 # Coordinator
 DEFAULT_UPDATE_INTERVAL = timedelta(hours=2)
+SUEZ_TOKEN_STORE_KEY = "suez_tokens"
 
 # Sensor unique ID suffixes
 SENSOR_METER_INDEX = "meter_index"
