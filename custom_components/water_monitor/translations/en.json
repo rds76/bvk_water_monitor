@@ -11,7 +11,7 @@
       },
       "reauth_confirm": {
         "title": "BVK Water Monitor – Re-authenticate",
-        "description": "Your BVK credentials have changed. Please enter them again.",
+        "description": "BVK login failed or could not be confirmed. Automatic login is paused. Check your account and enter your credentials again.",
         "data": {
           "username": "Email address",
           "password": "Password"
@@ -20,7 +20,8 @@
     },
     "error": {
       "invalid_auth": "Invalid email or password.",
-      "cannot_connect": "Could not connect to BVK portal. Check your network and try again."
+      "cannot_connect": "Could not connect to BVK portal or confirm the login. Check the service and try again manually.",
+      "cannot_save": "Could not save the login safety state. Check Home Assistant storage and try again."
     },
     "abort": {
       "already_configured": "This BVK account is already configured.",

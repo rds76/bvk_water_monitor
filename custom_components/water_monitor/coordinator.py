@@ -1,6 +1,7 @@
 """DataUpdateCoordinator for BVK Water Monitor."""
 from __future__ import annotations
 
+import asyncio
 import html as _html
 import logging
 import re
@@ -13,6 +14,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .auth_guard import LoginGuard
 from .const import (
     BVK_LOGIN_URL,
     BVK_PLACE_LIST_URL,
@@ -53,6 +55,7 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._username: str = entry.data[CONF_USERNAME]
         self._password: str = entry.data[CONF_PASSWORD]
+        self._login_guard = LoginGuard(hass, entry.entry_id)
         self._session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------
@@ -78,47 +81,21 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
 
     async def _bvk_login(self, session: aiohttp.ClientSession) -> None:
-        """Log in to the BVK portal."""
-        try:
-            async with session.get(
-                BVK_LOGIN_URL, timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-        except aiohttp.ClientError as exc:
-            raise UpdateFailed(f"BVK login page fetch failed: {exc}") from exc
-
-        viewstate = _extract_hidden(html, "__VIEWSTATE")
-        if not viewstate:
-            raise UpdateFailed("Could not parse BVK login page (missing __VIEWSTATE)")
-
-        payload = {
-            "__VIEWSTATE": viewstate,
-            "__VIEWSTATEGENERATOR": _extract_hidden(html, "__VIEWSTATEGENERATOR") or "",
-            "__PREVIOUSPAGE": _extract_hidden(html, "__PREVIOUSPAGE") or "",
-            "__EVENTVALIDATION": _extract_hidden(html, "__EVENTVALIDATION") or "",
-            _BVK_FIELD_EMAIL: self._username,
-            _BVK_FIELD_PASSWORD: self._password,
-            _BVK_FIELD_SUBMIT: "Vstoupit",
-            "ctl00$ctl00$captchaToken": "",
-            "ctl00$ctl00$crs": "",
-        }
-        try:
-            async with session.post(
-                BVK_LOGIN_URL,
-                data=payload,
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-        except aiohttp.ClientError as exc:
-            raise UpdateFailed(f"BVK login POST failed: {exc}") from exc
-
-        if "Odhlášení" not in html and "odhlaseni" not in html.lower():
-            raise ConfigEntryAuthFailed(
-                "BVK login failed — check your email and password"
-            )
+        """Log in once, stopping future attempts if login cannot be confirmed."""
+        async with self._login_guard.lock:
+            if await self._login_guard.async_is_blocked():
+                raise ConfigEntryAuthFailed(
+                    "BVK login is paused; re-enter your credentials to resume."
+                )
+            await self._login_guard.async_set_blocked(True)
+            try:
+                await _async_bvk_login(session, self._username, self._password)
+                await self._login_guard.async_set_blocked(False)
+            except (UpdateFailed, ConfigEntryAuthFailed, asyncio.TimeoutError) as exc:
+                raise ConfigEntryAuthFailed(
+                    "BVK login failed or could not be confirmed; "
+                    "re-enter your credentials to resume."
+                ) from exc
 
     async def _bvk_get_all_places(
         self, session: aiohttp.ClientSession
@@ -209,7 +186,7 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         allow_redirects=False and follow redirects manually so each step sees the
         cookies set by the previous response.
         """
-        _LOGGER.debug("SUEZ auth: requesting %s", token_url[:80])
+        _LOGGER.debug("SUEZ authentication started")
         _suez_headers = {
             "Referer": "https://zis.bvk.cz/ConsumptionPlaceList.aspx",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -236,11 +213,10 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     # last non-expired value for each name so it ends up in the jar.
                     _inject_cookies(session, resp)
 
-            except aiohttp.ClientError as exc:
-                raise UpdateFailed(f"SUEZ auth request failed: {exc}") from exc
+            except aiohttp.ClientError:
+                raise UpdateFailed("SUEZ auth request failed") from None
 
-            _LOGGER.debug("SUEZ auth step %d: status=%d url=%s location=%s",
-                          step + 1, status, current_url[:80], location[:80])
+            _LOGGER.debug("SUEZ auth step %d: status=%d", step + 1, status)
 
             if status in (301, 302, 303, 307, 308) and location:
                 # Resolve relative Location header
@@ -254,14 +230,14 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             if status == 200:
                 if "Login.aspx" not in current_url:
-                    _LOGGER.debug("SUEZ auth complete: %s", current_url)
+                    _LOGGER.debug("SUEZ auth complete")
                     return current_url
                 # Landed on Login page — token is invalid or expired
                 raise ConfigEntryAuthFailed(
                     "SUEZ token URL is invalid or has expired — please reconfigure"
                 )
 
-            raise UpdateFailed(f"SUEZ auth: unexpected HTTP {status} at {current_url}")
+            raise UpdateFailed(f"SUEZ auth: unexpected HTTP {status}")
 
         raise UpdateFailed("SUEZ auth: too many redirects")
 
@@ -366,8 +342,12 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         session = self._session
 
         # Step 1: BVK login → enumerate all consumption places
-        await self._bvk_login(session)
-        places = await self._bvk_get_all_places(session)
+        try:
+            await self._bvk_login(session)
+            places = await self._bvk_get_all_places(session)
+        finally:
+            await session.close()
+            self._session = None
 
         if not places:
             raise UpdateFailed(
@@ -420,6 +400,50 @@ class BVKWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+async def _async_bvk_login(
+    session: aiohttp.ClientSession, username: str, password: str
+) -> None:
+    """Submit one BVK login and verify the resulting page."""
+    try:
+        async with session.get(
+            BVK_LOGIN_URL, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise UpdateFailed("Could not load the BVK login page") from None
+
+    viewstate = _extract_hidden(html, "__VIEWSTATE")
+    if not viewstate:
+        raise UpdateFailed("Could not parse the BVK login page (missing __VIEWSTATE)")
+
+    payload = {
+        "__VIEWSTATE": viewstate,
+        "__VIEWSTATEGENERATOR": _extract_hidden(html, "__VIEWSTATEGENERATOR") or "",
+        "__PREVIOUSPAGE": _extract_hidden(html, "__PREVIOUSPAGE") or "",
+        "__EVENTVALIDATION": _extract_hidden(html, "__EVENTVALIDATION") or "",
+        _BVK_FIELD_EMAIL: username,
+        _BVK_FIELD_PASSWORD: password,
+        _BVK_FIELD_SUBMIT: "Vstoupit",
+        "ctl00$ctl00$captchaToken": "",
+        "ctl00$ctl00$crs": "",
+    }
+    try:
+        async with session.post(
+            BVK_LOGIN_URL,
+            data=payload,
+            allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise UpdateFailed("BVK login could not be confirmed") from None
+
+    if "Odhlášení" not in html and "odhlaseni" not in html.lower():
+        raise ConfigEntryAuthFailed("BVK login was not confirmed")
+
 
 def _extract_hidden(html: str, field_id: str) -> str | None:
     """Extract value of an ASP.NET hidden field by name or id."""

@@ -22,6 +22,11 @@ The daily sensor also exposes a `last_7_days` attribute with a date → litres h
 2. Uses a SUEZ Smart Solutions token URL to authenticate with the smart-meter data portal at `cz-sitr.suezsmartsolutions.com`.
 3. Scrapes the portal for meter index, daily and monthly consumption every **2 hours**.
 
+Every update starts a new BVK login. If a login fails or cannot be confirmed,
+automatic login is paused, including after a Home Assistant restart. Re-enter
+your credentials when Home Assistant requests re-authentication to resume.
+A network failure during login also pauses attempts to avoid repeated submissions.
+
 ---
 
 ## Installation
@@ -46,20 +51,9 @@ Go to **Settings → Integrations → Add Integration → BVK Water Monitor**.
 ### Step 1 — BVK credentials
 Enter your **email** and **password** for the BVK customer portal (`https://zis.bvk.cz`).
 
-The integration attempts to auto-detect your SUEZ smart-meter token URL. If your account has smart metering enabled and the token is found automatically, setup completes here.
-
-### Step 2 — SUEZ token URL *(only if auto-detection fails)*
-
-1. Open [https://zis.bvk.cz](https://zis.bvk.cz) in your browser and log in.
-2. Navigate to **Odběrná místa** (Consumption Places).
-3. Click the **smart meter icon** next to your consumption place.
-4. Copy the full URL from the browser address bar — it will look like:
-   ```
-   https://cz-sitr.suezsmartsolutions.com/eMIS.SE_BVK/Login.aspx?token=<long_token>&langue=cs-CZ
-   ```
-5. Paste it into the **SUEZ token URL** field.
-
-> **Note:** The token is long-lived (valid for months). If it ever stops working, repeat the steps above to get a fresh one and update the integration via **Settings → Integrations → BVK Water Monitor → Reconfigure**.
+The integration validates the credentials once for each form submission. If
+validation fails, it remains on the form and does not retry automatically.
+After successful setup, it logs in to discover the smart-meter token URL.
 
 ---
 
@@ -73,9 +67,9 @@ Currently only **BVK Brno (Czech Republic)** is supported. The integration relie
 
 | Symptom | Fix |
 |---|---|
-| `Invalid auth` at setup | Double-check your BVK email and password. |
-| Sensors unavailable after HA restart | The SUEZ session expired. The integration retries automatically using the stored token URL. |
-| Token URL validation fails | Get a fresh token URL by logging into BVK in your browser (see Step 2 above). |
+| Login fails at setup | Check the account and credentials before submitting the form again. |
+| Re-authentication requested | Login failed or could not be confirmed. Check the BVK portal and network, then re-enter your credentials. No automatic login is attempted until then. |
+| Sensors unavailable | Check connectivity and whether the BVK and SUEZ portals are available. |
 | Data is 1–2 days behind | Expected — the smart meter transmits readings with a ~24 h delay. |
 
 ---
