@@ -2,6 +2,8 @@
 
 A [HACS](https://hacs.xyz/)-compatible Home Assistant integration that pulls water consumption data from the **BVK (Brněnské vodárny a kanalizace)** customer portal and exposes it as sensors in Home Assistant.
 
+This repository is a modified fork of [koooop/bvk_water_monitor](https://github.com/koooop/bvk_water_monitor).
+
 ---
 
 ## Sensors
