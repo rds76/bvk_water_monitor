@@ -39,7 +39,7 @@ your credentials when Home Assistant requests re-authentication to resume.
 ### Via HACS (recommended)
 
 1. In HACS go to **Integrations → ⋮ → Custom repositories**.
-2. Add `https://github.com/koooop/bvk_water_monitor` with category **Integration**.
+2. Add `https://github.com/rds76/bvk_water_monitor` with category **Integration**.
 3. Install **BVK Water Monitor** and restart Home Assistant.
 
 ### Manual

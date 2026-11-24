@@ -1,10 +1,10 @@
 {
   "domain": "water_monitor",
   "name": "BVK Water Monitor",
-  "version": "1.0.9",
+  "version": "1.1.0",
   "config_flow": true,
-  "documentation": "https://github.com/koooop/bvk_water_monitor",
-  "issue_tracker": "https://github.com/koooop/bvk_water_monitor/issues",
+  "documentation": "https://github.com/rds76/bvk_water_monitor",
+  "issue_tracker": "https://github.com/rds76/bvk_water_monitor/issues",
   "dependencies": [],
   "codeowners": [],
   "requirements": [],
